@@ -3,6 +3,7 @@ package configs
 import (
 	version "github.com/hashicorp/go-version"
 	"github.com/hashicorp/hcl2/hcl"
+	"github.com/hashicorp/terraform/addrs"
 )
 
 // A Config is a node in the tree of modules within a configuration.
@@ -27,13 +28,12 @@ type Config struct {
 	// Path is a sequence of module logical names that traverse from the root
 	// module to this config. Path is empty for the root module.
 	//
-	// This should not be used to display a path to the end-user, since
-	// our UI conventions call for us to return a module address string in that
-	// case, and a module address string ought to be built from the dynamic
-	// module tree (resulting from evaluating "count" and "for_each" arguments
-	// on our calls to produce potentially multiple child instances per call)
-	// rather than from our static module tree.
-	Path []string
+	// This should only be used to display paths to the end-user in rare cases
+	// where we are talking about the static module tree, before module calls
+	// have been resolved. In most cases, a addrs.ModuleInstance describing
+	// a node in the dynamic module tree is better, since it will then include
+	// any keys resulting from evaluating "count" and "for_each" arguments.
+	Path addrs.Module
 
 	// ChildModules points to the Config for each of the direct child modules
 	// called from this module. The keys in this map match the keys in
