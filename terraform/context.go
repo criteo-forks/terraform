@@ -8,12 +8,13 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/hashicorp/terraform/configs"
 	"github.com/hashicorp/terraform/tfdiags"
+	"github.com/zclconf/go-cty/cty"
 
 	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/hcl"
 	"github.com/hashicorp/terraform/config"
-	"github.com/hashicorp/terraform/config/module"
 	"github.com/hashicorp/terraform/version"
 )
 
@@ -55,7 +56,7 @@ type ContextOpts struct {
 	Destroy            bool
 	Diff               *Diff
 	Hooks              []Hook
-	Module             *module.Tree
+	Config             *configs.Config
 	Parallelism        int
 	State              *State
 	StateFutureAllowed bool
@@ -63,7 +64,7 @@ type ContextOpts struct {
 	Provisioners       map[string]ResourceProvisionerFactory
 	Shadow             bool
 	Targets            []string
-	Variables          map[string]interface{}
+	Variables          InputValues
 
 	// If non-nil, will apply as additional constraints on the provider
 	// plugins that will be requested from the provider resolver.
@@ -97,14 +98,14 @@ type Context struct {
 	diffLock   sync.RWMutex
 	hooks      []Hook
 	meta       *ContextMeta
-	module     *module.Tree
+	config     *configs.Config
 	sh         *stopHook
 	shadow     bool
 	state      *State
 	stateLock  sync.RWMutex
 	targets    []string
 	uiInput    UIInput
-	variables  map[string]interface{}
+	variables  InputValues
 
 	l                   sync.Mutex // Lock acquired during any task
 	parallelSem         Semaphore
@@ -119,15 +120,18 @@ type Context struct {
 
 // NewContext creates a new Context structure.
 //
-// Once a Context is creator, the pointer values within ContextOpts
-// should not be mutated in any way, since the pointers are copied, not
-// the values themselves.
-func NewContext(opts *ContextOpts) (*Context, error) {
-	// Validate the version requirement if it is given
-	if opts.Module != nil {
-		if err := CheckRequiredVersion(opts.Module); err != nil {
-			return nil, err
-		}
+// Once a Context is created, the caller should not access or mutate any of
+// the objects referenced (directly or indirectly) by the ContextOpts fields.
+//
+// If the returned diagnostics contains errors then the resulting context is
+// invalid and must not be used.
+func NewContext(opts *ContextOpts) (*Context, tfdiags.Diagnostics) {
+	diags := CheckCoreVersionRequirements(opts.Config)
+	// If version constraints are not met then we'll bail early since otherwise
+	// we're likely to just see a bunch of other errors related to
+	// incompatibilities, which could be overwhelming for the user.
+	if diags.HasErrors() {
+		return nil, diags
 	}
 
 	// Copy all the hooks and add our stop hook. We don't append directly
@@ -145,8 +149,9 @@ func NewContext(opts *ContextOpts) (*Context, error) {
 
 	// If our state is from the future, then error. Callers can avoid
 	// this error by explicitly setting `StateFutureAllowed`.
-	if err := CheckStateVersion(state); err != nil && !opts.StateFutureAllowed {
-		return nil, err
+	if stateDiags := CheckStateVersion(state, opts.StateFutureAllowed); stateDiags.HasErrors() {
+		diags = diags.Append(stateDiags)
+		return nil, diags
 	}
 
 	// Explicitly reset our state version to our current version so that
@@ -168,27 +173,28 @@ func NewContext(opts *ContextOpts) (*Context, error) {
 	//    2 - Take values specified in -var flags, overriding values
 	//        set by environment variables if necessary. This includes
 	//        values taken from -var-file in addition.
-	variables := make(map[string]interface{})
-	if opts.Module != nil {
-		var err error
-		variables, err = Variables(opts.Module, opts.Variables)
-		if err != nil {
-			return nil, err
-		}
+	var variables InputValues
+	if opts.Config != nil {
+		// Default variables from the configuration seed our map.
+		variables = DefaultVariableValues(opts.Config.Module.Variables)
 	}
+	// Variables provided by the caller (from CLI, environment, etc) can
+	// override the defaults.
+	variables = variables.Override(opts.Variables)
 
 	// Bind available provider plugins to the constraints in config
 	var providers map[string]ResourceProviderFactory
 	if opts.ProviderResolver != nil {
 		var err error
-		deps := ModuleTreeDependencies(opts.Module, state)
+		deps := ConfigTreeDependencies(opts.Config, state)
 		reqd := deps.AllPluginRequirements()
 		if opts.ProviderSHA256s != nil && !opts.SkipProviderVerify {
 			reqd.LockExecutables(opts.ProviderSHA256s)
 		}
 		providers, err = resourceProviderFactories(opts.ProviderResolver, reqd)
 		if err != nil {
-			return nil, err
+			diags = diags.Append(err)
+			return nil, diags
 		}
 	} else {
 		providers = make(map[string]ResourceProviderFactory)
@@ -208,7 +214,7 @@ func NewContext(opts *ContextOpts) (*Context, error) {
 		diff:      diff,
 		hooks:     hooks,
 		meta:      opts.Meta,
-		module:    opts.Module,
+		config:    opts.Config,
 		shadow:    opts.Shadow,
 		state:     state,
 		targets:   opts.Targets,
@@ -242,7 +248,7 @@ func (c *Context) Graph(typ GraphType, opts *ContextGraphOpts) (*Graph, error) {
 	switch typ {
 	case GraphTypeApply:
 		return (&ApplyGraphBuilder{
-			Module:       c.module,
+			Config:       c.config,
 			Diff:         c.diff,
 			State:        c.state,
 			Providers:    c.components.ResourceProviders(),
@@ -261,7 +267,7 @@ func (c *Context) Graph(typ GraphType, opts *ContextGraphOpts) (*Graph, error) {
 	case GraphTypePlan:
 		// Create the plan graph builder
 		p := &PlanGraphBuilder{
-			Module:    c.module,
+			Config:    c.config,
 			State:     c.state,
 			Providers: c.components.ResourceProviders(),
 			Targets:   c.targets,
@@ -284,7 +290,7 @@ func (c *Context) Graph(typ GraphType, opts *ContextGraphOpts) (*Graph, error) {
 
 	case GraphTypePlanDestroy:
 		return (&DestroyPlanGraphBuilder{
-			Module:   c.module,
+			Config:   c.config,
 			State:    c.state,
 			Targets:  c.targets,
 			Validate: opts.Validate,
@@ -292,7 +298,7 @@ func (c *Context) Graph(typ GraphType, opts *ContextGraphOpts) (*Graph, error) {
 
 	case GraphTypeRefresh:
 		return (&RefreshGraphBuilder{
-			Module:    c.module,
+			Config:    c.config,
 			State:     c.state,
 			Providers: c.components.ResourceProviders(),
 			Targets:   c.targets,
@@ -337,99 +343,97 @@ func (c *Context) State() *State {
 	return c.state.DeepCopy()
 }
 
-// Interpolater returns an Interpolater built on a copy of the state
-// that can be used to test interpolation values.
-func (c *Context) Interpolater() *Interpolater {
+// Evaluator returns an Evaluator that references a copy of the state, and
+// that can be used to obtain data for expression evaluation within the
+// receiving context.
+func (c *Context) Evaluator() *Evaluator {
 	var varLock sync.Mutex
 	var stateLock sync.RWMutex
-	return &Interpolater{
-		Operation:          walkApply,
-		Meta:               c.meta,
-		Module:             c.module,
-		State:              c.state.DeepCopy(),
-		StateLock:          &stateLock,
-		VariableValues:     c.variables,
-		VariableValuesLock: &varLock,
+
+	return &Evaluator{
+		Operation:              walkApply,
+		Meta:                   c.meta,
+		Config:                 c.config,
+		State:                  c.state.DeepCopy(),
+		StateLock:              &stateLock,
+		RootVariableValues:     c.variables,
+		RootVariableValuesLock: &varLock,
 	}
+}
+
+// Interpolater is no longer used. Use Evaluator instead.
+//
+// The interpolator returned from this function will return an error on any use.
+func (c *Context) Interpolater() *Interpolater {
+	// FIXME: Remove this once all callers are updated to no longer use it.
+	var varLock sync.Mutex
+	var stateLock sync.RWMutex
+	return &Interpolater{}
 }
 
 // Input asks for input to fill variables and provider configurations.
 // This modifies the configuration in-place, so asking for Input twice
 // may result in different UI output showing different current values.
-func (c *Context) Input(mode InputMode) error {
+func (c *Context) Input(mode InputMode) tfdiags.Diagnostics {
+	var diags tfdiags.Diagnostics
 	defer c.acquireRun("input")()
 
 	if mode&InputModeVar != 0 {
 		// Walk the variables first for the root module. We walk them in
 		// alphabetical order for UX reasons.
-		rootConf := c.module.Config()
-		names := make([]string, len(rootConf.Variables))
-		m := make(map[string]*config.Variable)
-		for i, v := range rootConf.Variables {
-			names[i] = v.Name
-			m[v.Name] = v
+		configs := c.config.Module.Variables
+		names := make([]string, 0, len(configs))
+		for name := range configs {
+			names = append(names, name)
 		}
 		sort.Strings(names)
+	Variables:
 		for _, n := range names {
-			// If we only care about unset variables, then if the variable
-			// is set, continue on.
+			v := configs[n]
+
+			// If we only care about unset variables, then we should set any
+			// variable that is already set.
 			if mode&InputModeVarUnset != 0 {
-				if _, ok := c.variables[n]; ok {
-					continue
-				}
-			}
-
-			var valueType config.VariableType
-
-			v := m[n]
-			switch valueType = v.Type(); valueType {
-			case config.VariableTypeUnknown:
-				continue
-			case config.VariableTypeMap:
-				// OK
-			case config.VariableTypeList:
-				// OK
-			case config.VariableTypeString:
-				// OK
-			default:
-				panic(fmt.Sprintf("Unknown variable type: %#v", v.Type()))
-			}
-
-			// If the variable is not already set, and the variable defines a
-			// default, use that for the value.
-			if _, ok := c.variables[n]; !ok {
-				if v.Default != nil {
-					c.variables[n] = v.Default.(string)
+				if _, isSet := c.variables[n]; isSet {
 					continue
 				}
 			}
 
 			// this should only happen during tests
 			if c.uiInput == nil {
-				log.Println("[WARN] Content.uiInput is nil")
+				log.Println("[WARN] Context.uiInput is nil during input walk")
 				continue
 			}
 
 			// Ask the user for a value for this variable
-			var value string
+			var rawValue string
 			retry := 0
 			for {
 				var err error
-				value, err = c.uiInput.Input(&InputOpts{
+				rawValue, err = c.uiInput.Input(&InputOpts{
 					Id:          fmt.Sprintf("var.%s", n),
 					Query:       fmt.Sprintf("var.%s", n),
 					Description: v.Description,
 				})
 				if err != nil {
-					return fmt.Errorf(
-						"Error asking for %s: %s", n, err)
+					diags = diags.Append(tfdiags.Sourceless(
+						tfdiags.Error,
+						"Failed to request interactive input",
+						fmt.Sprintf("Terraform attempted to request a value for var.%s interactively, but encountered an error: %s.", n, err),
+					))
+					return diags
 				}
 
-				if value == "" && v.Required() {
+				if rawValue == "" && v.Default == cty.NilVal {
 					// Redo if it is required, but abort if we keep getting
 					// blank entries
 					if retry > 2 {
-						return fmt.Errorf("missing required value for %q", n)
+						diags = diags.Append(tfdiags.Sourceless(
+							tfdiags.Error,
+							"Required variable not assigned",
+							fmt.Sprintf("The variable %q is required, so Terraform cannot proceed without a defined value for it.", n),
+						))
+						continue Variables
 					}
 					retry++
 					continue
@@ -438,18 +442,15 @@ func (c *Context) Input(mode InputMode) error {
 				break
 			}
 
-			// no value provided, so don't set the variable at all
-			if value == "" {
+			val, valDiags := v.ParsingMode.Parse(n, rawValue)
+			diags = diags.Append(valDiags)
+			if diags.HasErrors() {
 				continue
 			}
 
-			decoded, err := parseVariableAsHCL(n, value, valueType)
-			if err != nil {
-				return err
-			}
-
-			if decoded != nil {
-				c.variables[n] = decoded
+			c.variables[n] = &InputValue{
+				Value:      val,
+				SourceType: ValueFromInput,
 			}
 		}
 	}
@@ -458,16 +459,18 @@ func (c *Context) Input(mode InputMode) error {
 		// Build the graph
 		graph, err := c.Graph(GraphTypeInput, nil)
 		if err != nil {
-			return err
+			diags = diags.Append(err)
+			return diags
 		}
 
 		// Do the walk
 		if _, err := c.walk(graph, walkInput); err != nil {
-			return err
+			diags = diags.Append(err)
+			return diags
 		}
 	}
 
-	return nil
+	return diags
 }
 
 // Apply applies the changes represented by this context and returns
@@ -525,8 +528,8 @@ func (c *Context) Plan() (*Plan, error) {
 	defer c.acquireRun("plan")()
 
 	p := &Plan{
-		Module:  c.module,
-		Vars:    c.variables,
+		Config:  c.config,
+		Vars:    c.variables.JustValues(),
 		State:   c.state,
 		Targets: c.targets,
 
@@ -667,26 +670,26 @@ func (c *Context) Stop() {
 	log.Printf("[WARN] terraform: stop complete")
 }
 
-// Validate validates the configuration and returns any warnings or errors.
+// Validate performs semantic validation of the configuration, and returning
+// any warnings or errors.
+//
+// Syntax and structural checks are performed by the configuration loader,
+// and so are not repeated here.
 func (c *Context) Validate() tfdiags.Diagnostics {
 	defer c.acquireRun("validate")()
 
 	var diags tfdiags.Diagnostics
 
-	// Validate the configuration itself
-	diags = diags.Append(c.module.Validate())
-
-	// This only needs to be done for the root module, since inter-module
-	// variables are validated in the module tree.
-	if config := c.module.Config(); config != nil {
-		// Validate the user variables
-		for _, err := range smcUserVariables(config, c.variables) {
-			diags = diags.Append(err)
-		}
+	// Validate input variables. We do this only for the values supplied
+	// by the root module, since child module calls are validated when we
+	// visit their graph nodes.
+	if c.config != nil {
+		varDiags := checkInputVariables(c.config.Module.Variables, c.variables)
+		diags = diags.Append(varDiags)
 	}
 
-	// If we have errors at this point, the graphing has no chance,
-	// so just bail early.
+	// If we have errors at this point then we probably won't be able to
+	// construct a graph without producing redundant errors, so we'll halt early.
 	if diags.HasErrors() {
 		return diags
 	}
@@ -722,21 +725,24 @@ func (c *Context) Validate() tfdiags.Diagnostics {
 	return diags
 }
 
-// Module returns the module tree associated with this context.
-func (c *Context) Module() *module.Tree {
-	return c.module
+// Config returns the configuration tree associated with this context.
+func (c *Context) Config() *configs.Config {
+	return c.config
 }
 
 // Variables will return the mapping of variables that were defined
 // for this Context. If Input was called, this mapping may be different
 // than what was given.
-func (c *Context) Variables() map[string]interface{} {
+func (c *Context) Variables() InputValues {
 	return c.variables
 }
 
 // SetVariable sets a variable after a context has already been built.
-func (c *Context) SetVariable(k string, v interface{}) {
-	c.variables[k] = v
+func (c *Context) SetVariable(k string, v cty.Value) {
+	c.variables[k] = &InputValue{
+		Value:      v,
+		SourceType: ValueFromCaller,
+	}
 }
 
 func (c *Context) acquireRun(phase string) func() {

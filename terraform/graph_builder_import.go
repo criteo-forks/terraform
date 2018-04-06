@@ -2,6 +2,7 @@ package terraform
 
 import (
 	"github.com/hashicorp/terraform/config/module"
+	"github.com/hashicorp/terraform/configs"
 	"github.com/hashicorp/terraform/dag"
 )
 
@@ -12,8 +13,8 @@ type ImportGraphBuilder struct {
 	// ImportTargets are the list of resources to import.
 	ImportTargets []*ImportTarget
 
-	// Module is the module to add to the graph. See ImportOpts.Module.
-	Module *module.Tree
+	// Module is a configuration to build the graph from. See ImportOpts.Config.
+	Config *configs.Config
 
 	// Providers is the list of providers supported.
 	Providers []string
