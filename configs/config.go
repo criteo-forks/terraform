@@ -121,10 +121,27 @@ func (c *Config) AllModules() []*Config {
 // count and for_each arguments.
 //
 // An empty path will just return the receiver, and is therefore pointless.
-func (c *Config) Descendent(path []string) *Config {
+func (c *Config) Descendent(path addrs.Module) *Config {
 	current := c
 	for _, name := range path {
 		current = current.Children[name]
+		if current == nil {
+			return nil
+		}
+	}
+	return current
+}
+
+// DescendentForInstance is like Descendent except that it accepts a path
+// to a particular module instance in the dynamic module graph, returning
+// the node from the static module graph that corresponds to it.
+//
+// All instances created by a particular module call share the same
+// configuration, so the keys within the given path are disregarded.
+func (c *Config) DescendentForInstance(path addrs.ModuleInstance) *Config {
+	current := c
+	for _, step := range path {
+		current = current.Children[step.Name]
 		if current == nil {
 			return nil
 		}
