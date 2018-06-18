@@ -23,14 +23,14 @@ before_script:
 - git config --global url.https://github.com/.insteadOf ssh://git@github.com/
 
 script:
-- find . -type f -name "*go" | xargs sed 's|github.com/hashicorp/consul|github.com/criteo-forks/terraform|' -i
+- find . -type f -name "*go" | xargs sed 's|github.com/hashicorp/terraform|github.com/criteo-forks/terraform|' -i
 - export VERSION=$(echo $TRAVIS_TAG | sed 's/^v//' )
 - export PRERELEASE=$(echo $VERSION | cut -d '-' -f 2)
-- sed -i "s/VersionPrerelease = \".*\"/VersionPrerelease = \"$PRERELEASE\"/" version/version.go    
-- make vendor-status
+- sed -i "s/VersionPrerelease = \".*\"/VersionPrerelease = \"$PRERELEASE\"/" version/version.go
+- make fmt
 - make test
 - make e2etest
-- GOOS=windows go build
+- make bin
 
 before_deploy:
 - echo "Deploying $VERSION(-$PRERELEASE) to GitHub releases"
