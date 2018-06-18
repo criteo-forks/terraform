@@ -1,29 +1,21 @@
 dist: trusty
 sudo: false
 language: go
+
 go:
-- "1.10.1"
+- 1.10.1
 
-# add TF_CONSUL_TEST=1 to run consul tests
-# they were causing timouts in travis
-# add TF_ETCDV3_TEST=1 to run etcdv3 tests
-# if added, TF_ETCDV3_ENDPOINTS must be set to a comma-separated list of (insecure) etcd endpoints against which to test
 env:
-  - CONSUL_VERSION=0.7.5 GOMAXPROCS=4
+- CONSUL_VERSION=0.7.5 GOMAXPROCS=4 XC_OS="linux windows" XC_ARCH=amd64
 
-# Fetch consul for the backend and provider tests
 before_install:
-  - curl -sLo consul.zip https://releases.hashicorp.com/consul/${CONSUL_VERSION}/consul_${CONSUL_VERSION}_linux_amd64.zip
-  - unzip consul.zip
-  - mkdir -p ~/bin
-  - mv consul ~/bin
-  - export PATH="~/bin:$PATH"
+- curl -sLo consul.zip https://releases.hashicorp.com/consul/${CONSUL_VERSION}/consul_${CONSUL_VERSION}_linux_amd64.zip
+- unzip consul.zip
+- mkdir -p ~/bin
+- mv consul ~/bin
+- export PATH="~/bin:$PATH"
 
 install:
-# This script is used by the Travis build to install a cookie for
-# go.googlesource.com so rate limits are higher when using `go get` to fetch
-# packages that live there.
-# See: https://github.com/golang/go/issues/12933
 - bash scripts/gogetcookie.sh
 - go get github.com/kardianos/govendor
 
@@ -31,20 +23,26 @@ before_script:
 - git config --global url.https://github.com/.insteadOf ssh://git@github.com/
 
 script:
+- find . -type f -name "*go" | xargs sed 's|github.com/hashicorp/consul|github.com/criteo-forks/terraform|' -i
+- export VERSION=$(echo $TRAVIS_TAG | sed 's/^v//' )
+- export PRERELEASE=$(echo $VERSION | cut -d '-' -f 2)
+- sed -i "s/VersionPrerelease = \".*\"/VersionPrerelease = \"$PRERELEASE\"/" version/version.go    
 - make vendor-status
 - make test
 - make e2etest
 - GOOS=windows go build
-branches:
-  only:
-  - master
-notifications:
-  irc:
-    channels:
-    - irc.freenode.org#terraform-tool
-    skip_join: true
-    use_notice: true
-matrix:
-  fast_finish: true
-  allow_failures:
-  - go: tip
+
+before_deploy:
+- echo "Deploying $VERSION(-$PRERELEASE) to GitHub releases"
+- for d in $(find ./pkg -type d -maxdepth 1 -mindepth 1 | cut -d '/' -f3); do zip -j terraform_${VERSION}_${d}.zip ./pkg/${d}/terraform* ; done
+
+deploy:
+  provider: releases
+  api_key:
+    secure: PfHurlRoJOIKLlk0lyCE9ic8fdIIpwmVp+P82WgRvTDLJyDhn1OYntS8p7qR1m+pyVux2JmIoOSUd7WfeXwKyeMh45wP7jKV7h6X3Cn+PhLvZtzfucKiVAVWGzVn7jTHh3bWDBO2kf3oFm6FRKWShCh3svvIGBPri7pr+556EPG+ROtP4cthUYSKzRdXNmlHiDjaXiwbrkCgHM/bZ9N27YA0hHsJlk5CM3PdPTc0+8W1WuqTL7fc6p+vvh2p0eUtm6q4zYCxGz3H9uSS3S9ROnAZjh6cuH42jhrrDxWFXUHTN6Y/EoPOPXypeJZTyTd8QOI2SbUcYim/tKmKL2tjUrE8gIhKunwfFJ+BqMJjrJvGgeuK8Uf+JxNT+Ci1FwGRH8yCxFvKJc/M6a3uSApmbPNZ2nrHvUbu6NAfcNOtB5z2KXjzUmg2N94hVvtCWdJB8Ac1P0FZY3S0mVa2XttuKoX8w4xAETFaAWhrRfDLjqAbhvjxxsx2X5GYoVSTegHg5IIo81622aXwn4W6QxH6R1NbtC8bH55r4KGc/50VSfICxKEdCqvfz7ZVOxJ6vCMB8aEaIoXV/bjjFEkuaOz004Ju4bfHXDwth+6lX5GRuOLRXjm1STGcik7XyyvCClIzn1zuiJohLpTahar/Lk4iQHv6aEamJVJyjk63oyem/UE=
+  file: terraform_*.zip
+  skip_cleanup: true
+  file_glob: true
+  on:
+    repo: criteo-forks/terraform
+    branch: criteo
