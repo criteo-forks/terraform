@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	chmod      = "find %s -maxdepth 1 -type f -exec /bin/chmod %d {} +"
+	chmod      = "find %s -maxdepth 1 -type f -exec /bin/chmod -R %d {} +"
 	installURL = "https://omnitruck.chef.io/install.sh"
 )
 
@@ -51,7 +51,7 @@ func (p *provisioner) preUploadDirectory(o terraform.UIOutput, comm communicator
 
 	// Make sure we have enough rights to upload the files if using sudo
 	if p.useSudo {
-		if err := p.runCommand(o, comm, "chmod 777 "+dir); err != nil {
+		if err := p.runCommand(o, comm, "chmod -R 777 "+dir); err != nil {
 			return err
 		}
 		if err := p.runCommand(o, comm, fmt.Sprintf(chmod, dir, 666)); err != nil {
@@ -64,7 +64,7 @@ func (p *provisioner) preUploadDirectory(o terraform.UIOutput, comm communicator
 func (p *provisioner) postUploadDirectory(o terraform.UIOutput, comm communicator.Communicator, dir string) error {
 	// When done copying the hints restore the rights and make sure root is owner
 	if p.useSudo {
-		if err := p.runCommand(o, comm, "chmod 755 "+dir); err != nil {
+		if err := p.runCommand(o, comm, "chmod -R 755 "+dir); err != nil {
 			return err
 		}
 		if err := p.runCommand(o, comm, fmt.Sprintf(chmod, dir, 600)); err != nil {

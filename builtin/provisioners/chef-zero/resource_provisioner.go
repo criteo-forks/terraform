@@ -643,15 +643,13 @@ func (p *provisioner) runChefClientFunc(chefCmd string, confDir string) provisio
 	return func(o terraform.UIOutput, comm communicator.Communicator) error {
 		fb := path.Join(confDir+"/dna/", p.NodeAttributes["id"].(string)+".json")
 		var cmd string
-		var pipelog string = ""
-
 		// Policyfiles do not support chef environments, so don't pass the `-E` flag.
 		switch {
 
 		case p.UsePolicyfile && p.NamedRunList == "":
 			cmd = fmt.Sprintf("%s -z -c %s -j %q", chefCmd, path.Join(confDir, clienrb), fb)
 		case p.UsePolicyfile && p.NamedRunList != "":
-			cmd = fmt.Sprintf("%s -z -c %s -j %q -n %q", chefCmd, path.Join(confDir, clienrb), fb, pipelog)
+			cmd = fmt.Sprintf("%s -z -c %s -j %q -n %q", chefCmd, path.Join(confDir, clienrb), fb, p.NamedRunList)
 		default:
 			cmd = fmt.Sprintf("%s -z -c %s -j %q -E %q", chefCmd, path.Join(confDir, clienrb), fb, p.Environment)
 		}
